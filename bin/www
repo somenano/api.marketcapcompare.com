@@ -263,7 +263,7 @@ var get_reddit_data = function() {
 
 var data_refresh = async function() {
 
-  if (exports.verbose) console.log('Starting data refresh');
+  console.log('Starting data refresh');
 
   // Get tick data
   await CMCclient.getTickers().then(set_cmc_data).catch(console.error);
@@ -275,6 +275,11 @@ var data_refresh = async function() {
     }
   } catch(e) {
     console.error(e);
+    return;
+  }
+
+  if (id_array.length == 0) {
+    console.error('In www.data_refresh, ticker data failed to populate, exiting data refresh.');
     return;
   }
 
@@ -310,7 +315,7 @@ var data_refresh = async function() {
   // console.log(exports.metadata);
 
 
-  if (exports.verbose) console.log('Done with data refresh');
+  console.log('Done with data refresh');
 
 }
 var data_refresh_interval = setInterval(data_refresh, process.env.PERIODIC_MINUTES*60*1000); // refresh periodically
