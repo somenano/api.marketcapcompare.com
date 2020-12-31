@@ -1,0 +1,378 @@
+#!/usr/bin/env node
+
+/**
+ * Module dependencies.
+ */
+
+require('dotenv').config()
+var app = require('../app');
+var debug = require('debug')('repeater');
+var http = require('http');
+const axios = require('axios');
+var socketIO = require('socket.io');
+const js_helper = require('../helpers/js');
+const db_query = require('../helpers/db_query.js');
+
+/**
+ * Models
+ */
+const Tick = require('../models/tick.js');
+const MetaData = require('../models/metadata.js');
+
+/**
+ * Get port from environment and store in Express.
+ */
+
+var port = normalizePort(process.env.PORT || '3000');
+app.set('port', port);
+
+/**
+ * Create HTTP server.
+ */
+
+var server = http.createServer(app);
+
+/**
+ * Listen on provided port, on all network interfaces.
+ */
+server.listen(port);
+server.on('error', onError);
+server.on('listening', onListening);
+
+// Socket.io
+exports.io = socketIO(server, {
+  pingTimeout: 60000,
+});
+exports.io.on('connection', (client) => {
+  // console.log('Socket.io Connected');
+  // client.on('disconnect', () => console.log('Socket.io Disconnected'));
+
+  client.on('subscribe_periodic', data=> {
+    client.join('periodic');
+    client.emit('periodic', exports.emit_data);
+    console.log('new client subscribed to: subscribe_all');
+  });
+
+});
+exports.io.on('disconnect', (client) => {
+})
+
+const CoinMarketCap = require('coinmarketcap-api');
+const { url } = require('inspector');
+const e = require('express');
+const CMCclient = new CoinMarketCap(process.env.CMC_API_KEY);
+
+exports.data = {};
+exports.metadata = {};
+exports.redditdata = {};
+exports.emit_data = {};
+exports.tick_change_data = {};
+exports.verbose = true;
+
+var set_cmc_data = async function(data, force=false) {
+
+  if (exports.verbose) console.log('Setting data');
+
+  if (data['status']['error_code'] == 0 || force==true) {
+    exports.data = data;
+    exports.tick_change_data = {}
+    
+    // Update db
+    exports.tick_change_data = {
+      'price': {},
+      'reddit': {}
+    }
+    let time_bucket = new Date().time_bucket();
+    for (let asset of data.data) {
+      let asset_tick = new Tick({
+        dtg: new Date(asset.quote.USD.last_updated),
+        symbol: asset.symbol,
+        price: asset.quote.USD.price,
+        marketcap: asset.quote.USD.market_cap,
+        volume_24h: asset.quote.USD.volume_24h
+      });
+      await asset_tick.save().catch(function(e) {
+        console.error('In www.set_cmc_data: Attempted to save asset_tick and errored');
+        console.error(e);
+        console.error(asset_tick);
+      });
+      
+      exports.tick_change_data.price[asset.symbol] = {
+        'last_updated': asset.quote.USD.last_updated,
+        '1h': asset.quote.USD.percent_change_1h,
+        '24h': asset.quote.USD.percent_change_24h,
+        '7d': asset.quote.USD.percent_change_7d,
+        'source': {
+          '1h': 'api.coinmarketcap.com',
+          '24h': 'api.coinmarketcap.com',
+          '7d': 'api.coinmarketcap.com'
+        }
+      }
+      exports.tick_change_data.reddit[asset.symbol] = {
+        '1h': undefined,
+        '24h': undefined,
+        '7d': undefined,
+        'source': {
+          '1h': undefined,
+          '24h': undefined,
+          '7d': undefined
+        }
+      };
+    }
+
+  } else {
+    console.error('set_cmc_data was given data with error code: ' + data['status']['error_code']);
+    console.error(data['status']['error_message']);
+  }
+
+  if (exports.verbose) console.log('Done setting data');
+  
+}
+
+var set_cmc_metadata = async function(metadata, force) {
+
+  if (exports.verbose) console.log('Setting metadata');
+
+  if (metadata['status']['error_code'] == 0 || force==true) {
+    exports.metadata = metadata;
+
+    // Update db
+    for (let asset of Object.entries(metadata.data)) {
+      asset = asset[1];
+      let asset_metadata = {
+        date_updated: new Date(metadata.status.timestamp),
+        symbol: asset.symbol,
+        name: asset.name,
+        subreddit: asset.subreddit.toLowerCase(),
+        twitter: asset.twitter_username,
+        logo: asset.logo
+      };
+      MetaData.updateOne({symbol: asset.symbol}, asset_metadata, {upsert: true}).catch(function(e) {
+        console.error('In www.set_cmc_metadata: Attempted to update metadata with symbol: ' + asset.symbol);
+        console.error(e);
+        console.error(asset_metadata);
+      });
+    }
+  } else {
+    console.error('set_metadata was given data with error code: ' + metadata['status']['error_code']);
+    console.error(data['status']['error_message']);
+  }
+
+  if (exports.verbose) console.log('Done setting metadata');
+}
+
+var get_db_tick_change_data = function() {
+  return new Promise(async function(resolve, reject) {
+    let ticks_1h_array = await db_query.tick_time_bucket_unique(js_helper.hours_from_now(-1).time_bucket(), 100);
+    let ticks_24h_array = await db_query.tick_time_bucket_unique(js_helper.hours_from_now(-24).time_bucket(), 100);
+    let ticks_7d_array = await db_query.tick_time_bucket_unique(js_helper.hours_from_now(-1*(24*7)).time_bucket(), 100);
+
+    let ticks_1h = {};
+    if (ticks_1h_array) ticks_1h = js_helper.array_of_obj_to_obj(ticks_1h_array, 'symbol');
+    let ticks_24h = {};
+    if (ticks_24h_array) ticks_24h = js_helper.array_of_obj_to_obj(ticks_24h_array, 'symbol');
+    let ticks_7d = {};
+    if (ticks_7d_array) ticks_7d = js_helper.array_of_obj_to_obj(ticks_7d_array, 'symbol');
+
+    for (let asset of exports.data.data) {
+      if (ticks_1h[asset.symbol]){
+        exports.tick_change_data['price'][asset.symbol]['1h'] = 100 * ((asset.quote.USD.price - ticks_1h[asset.symbol].price) / ticks_1h[asset.symbol].price);
+        exports.tick_change_data['price'][asset.symbol]['source']['1h'] = 'api.marketcapcompare.com';
+        if (exports.redditdata[asset.symbol]) {
+          // TODO: these subs diffs are not calculating correctly
+          exports.tick_change_data['reddit'][asset.symbol]['1h'] = {
+            'subs_total': 100 * ((exports.redditdata[asset.symbol].subscribers - ticks_1h[asset.symbol].reddit_subs_total) / ticks_1h[asset.symbol].reddit_subs_total),
+            'subs_active': 100 * ((exports.redditdata[asset.symbol].active_user_count - ticks_1h[asset.symbol].reddit_subs_active) / ticks_1h[asset.symbol].reddit_subs_active)
+          };
+          exports.tick_change_data['reddit'][asset.symbol]['source']['1h'] = 'api.marketcapcompare.com';
+        }
+      } else {
+        if (exports.verbose) console.log('no 1h archive tick data for '+ asset.symbol);
+      }
+      if (ticks_24h[asset.symbol]) {
+        exports.tick_change_data['price'][asset.symbol]['24h'] = 100 * ((asset.quote.USD.price - ticks_24h[asset.symbol].price) / ticks_24h[asset.symbol].price);
+        exports.tick_change_data['price'][asset.symbol]['source']['24h'] = 'api.marketcapcompare.com';
+        if (exports.redditdata[asset.symbol]) {
+          exports.tick_change_data['reddit'][asset.symbol]['24h'] = {
+            'subs_total': 100 * ((exports.redditdata[asset.symbol].subscribers - ticks_24h[asset.symbol].reddit_subs_total) / ticks_24h[asset.symbol].reddit_subs_total),
+            'subs_active': 100 * ((exports.redditdata[asset.symbol].active_user_count - ticks_24h[asset.symbol].reddit_subs_active) / ticks_24h[asset.symbol].reddit_subs_active)
+          };
+          exports.tick_change_data['reddit'][asset.symbol]['source']['1h'] = 'api.marketcapcompare.com';
+        }
+      } else {
+        if (exports.verbose) console.log('no 24h archive tick data for '+ asset.symbol);
+      }
+      if (ticks_7d[asset.symbol]) {
+        exports.tick_change_data['price'][asset.symbol]['7d'] = 100 * ((asset.quote.USD.price - ticks_7d[asset.symbol].price) / ticks_7d[asset.symbol].price);
+        exports.tick_change_data['price'][asset.symbol]['source']['7d'] = 'api.marketcapcompare.com';
+        if (exports.redditdata[asset.symbol]) {
+          exports.tick_change_data['reddit'][asset.symbol]['7d'] = {
+            'subs_total': 100 * ((exports.redditdata[asset.symbol].subscribers - ticks_7d[asset.symbol].reddit_subs_total) / ticks_7d[asset.symbol].reddit_subs_total),
+            'subs_active': 100 * ((exports.redditdata[asset.symbol].active_user_count - ticks_7d[asset.symbol].reddit_subs_active) / ticks_7d[asset.symbol].reddit_subs_active)
+          };
+          exports.tick_change_data['reddit'][asset.symbol]['source']['1h'] = 'api.marketcapcompare.com';
+        }
+      } else {
+        if (exports.verbose) console.log('no 7d archive tick data for '+ asset.symbol);
+      }
+    }
+    resolve();
+    return;
+  });
+}
+
+var get = function(url) {
+  return axios.get(url);
+}
+
+var get_reddit_data = function() {
+  return new Promise(async function(resolve, reject) {
+    // Get reddit data for assets in metadata that have subreddit listed
+    let gets = [];
+    for (let asset of Object.entries(exports.metadata.data)) {
+      asset = asset[1];
+      if (asset.subreddit === undefined || asset.subreddit.length == 0) continue;
+      gets.push(get('https://www.reddit.com/r/'+asset.subreddit+'/about.json'));
+    }
+
+    await Promise.all(gets).then(async function(results) {
+      for (let result of results) {
+        if (result === undefined || result.data === undefined || result.data.data === undefined) continue;
+        let data = result.data.data;
+        let metadata = await MetaData.findOne({subreddit: data.display_name.toLowerCase()}).exec();
+        if (!metadata || metadata === undefined) continue;
+        exports.redditdata[metadata.symbol] = data;
+        await Tick.findOneAndUpdate({symbol: metadata.symbol}, {
+          reddit_subs_total: data.subscribers,
+          reddit_subs_active: data.active_user_count
+        }).sort({dtg:-1}).exec().catch(function(error) {
+          console.error('In www.get_reddit_data: error thrown executing Tick.findOneAndUpdate');
+          console.error(error);
+        });
+        if (exports.verbose) console.log('Updated Tick with subreddit ' + data.display_name);
+      }
+    }).catch(function(error) {
+      reject(error);
+      return;
+    });
+
+    resolve();
+    return;
+  });
+}
+
+var data_refresh = async function() {
+
+  if (exports.verbose) console.log('Starting data refresh');
+
+  // Get tick data
+  await CMCclient.getTickers().then(set_cmc_data).catch(console.error);
+
+  let id_array = [];
+  try {
+    for (let asset_data of exports.data['data']) {
+      id_array.push(asset_data['id']);
+    }
+  } catch(e) {
+    console.error(e);
+    return;
+  }
+
+  // Get metadata for assets from ticks
+  await CMCclient.getMetadata({id:id_array}).then(set_cmc_metadata).catch(console.error);
+
+  // Get all reddit data
+  await get_reddit_data().catch(console.error);
+
+  // Update tick change data
+  await get_db_tick_change_data();
+
+  // Update emit structure
+  let time_bucket = new Date().time_bucket();
+  
+  let data_array = await db_query.tick_time_bucket_unique(time_bucket, 100);
+  if (data_array) data_array.forEach(e=>{delete e.id; delete e._id; delete e.__v});
+  let metadata_array = await db_query.metadata_symbols(data_array.map(e => e.symbol));
+  if (metadata_array) metadata_array.forEach(e=>{delete e.id; delete e._id; delete e.__v});
+  
+  exports.emit_data = {};
+  exports.emit_data.dtg = new Date();
+  exports.emit_data.data = js_helper.array_of_obj_to_obj(data_array, 'symbol');
+  exports.emit_data.metadata = js_helper.array_of_obj_to_obj(metadata_array, 'symbol');
+  exports.emit_data.tick_change_data = exports.tick_change_data;
+
+  // console.log(exports.emit_data);
+
+  // Emit periodic data with socket.io
+  exports.io.to('periodic').emit('periodic', exports.emit_data);
+
+  // console.log(exports.data);
+  // console.log(exports.metadata);
+
+
+  if (exports.verbose) console.log('Done with data refresh');
+
+}
+var data_refresh_interval = setInterval(data_refresh, process.env.PERIODIC_MINUTES*60*1000); // refresh periodically
+data_refresh();  // initial call
+
+
+/**
+ * Normalize a port into a number, string, or false.
+ */
+
+function normalizePort(val) {
+  var port = parseInt(val, 10);
+
+  if (isNaN(port)) {
+    // named pipe
+    return val;
+  }
+
+  if (port >= 0) {
+    // port number
+    return port;
+  }
+
+  return false;
+}
+
+/**
+ * Event listener for HTTP server "error" event.
+ */
+
+function onError(error) {
+  if (error.syscall !== 'listen') {
+    throw error;
+  }
+
+  var bind = typeof port === 'string'
+    ? 'Pipe ' + port
+    : 'Port ' + port;
+
+  // handle specific listen errors with friendly messages
+  switch (error.code) {
+    case 'EACCES':
+      console.error(bind + ' requires elevated privileges');
+      process.exit(1);
+      break;
+    case 'EADDRINUSE':
+      console.error(bind + ' is already in use');
+      process.exit(1);
+      break;
+    default:
+      throw error;
+  }
+}
+
+/**
+ * Event listener for HTTP server "listening" event.
+ */
+
+function onListening() {
+  var addr = server.address();
+  var bind = typeof addr === 'string'
+    ? 'pipe ' + addr
+    : 'port ' + addr.port;
+  debug('Listening on ' + bind);
+}
