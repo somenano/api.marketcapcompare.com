@@ -67,7 +67,7 @@ exports.metadata = {};
 exports.redditdata = {};
 exports.emit_data = {};
 exports.tick_change_data = {};
-exports.verbose = true;
+exports.verbose = (process.env.VERBOSE.toLowerCase() == 'true');
 
 var set_cmc_data = async function(data, force=false) {
 
