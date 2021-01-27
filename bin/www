@@ -23,7 +23,7 @@ const MetaData = require('../models/metadata.js');
  * Get port from environment and store in Express.
  */
 
-var port = normalizePort(process.env.PORT || '3000');
+var port = normalizePort(process.env.PORT || '3003');
 app.set('port', port);
 
 /**
@@ -228,33 +228,41 @@ var get = function(url) {
 var get_reddit_data = function() {
   return new Promise(async function(resolve, reject) {
     // Get reddit data for assets in metadata that have subreddit listed
-    let gets = [];
     for (let asset of Object.entries(exports.metadata.data)) {
+
       asset = asset[1];
       if (asset.subreddit === undefined || asset.subreddit.length == 0) continue;
-      gets.push(get('https://www.reddit.com/r/'+asset.subreddit+'/about.json'));
-    }
+      
+      let result = await get('https://www.reddit.com/r/'+asset.subreddit+'/about.json').catch(function(error) {
+        console.error('In www.get_reddit_data for subreddit: '+ asset.subreddit +' an error has been caught');
+        console.error(error);
+      });
 
-    await Promise.all(gets).then(async function(results) {
-      for (let result of results) {
-        if (result === undefined || result.data === undefined || result.data.data === undefined) continue;
-        let data = result.data.data;
-        let metadata = await MetaData.findOne({subreddit: data.display_name.toLowerCase()}).exec();
-        if (!metadata || metadata === undefined) continue;
-        exports.redditdata[metadata.symbol] = data;
-        await Tick.findOneAndUpdate({symbol: metadata.symbol}, {
-          reddit_subs_total: data.subscribers,
-          reddit_subs_active: data.active_user_count
-        }).sort({dtg:-1}).exec().catch(function(error) {
-          console.error('In www.get_reddit_data: error thrown executing Tick.findOneAndUpdate');
-          console.error(error);
-        });
-        if (exports.verbose) console.log('Updated Tick with subreddit ' + data.display_name);
-      }
-    }).catch(function(error) {
-      reject(error);
-      return;
-    });
+      if (result === undefined || result.data === undefined || result.data.data === undefined) {
+        console.error('In www.get_reddit_data for subreddit: '+ asset.subreddit +' no data was returned');
+        continue;
+      };
+
+      let data = result.data.data;
+      let metadata = await MetaData.findOne({subreddit: data.display_name.toLowerCase()}).exec();
+      if (!metadata || metadata === undefined) {
+        console.error('In www.get_reddit_data for subreddit: '+ asset.subreddit +' metadata was not found. This should not ever happen.');
+        continue;
+      };
+      exports.redditdata[metadata.symbol] = data;
+
+      let find = await Tick.findOneAndUpdate({symbol: metadata.symbol}, {
+        reddit_subs_total: data.subscribers,
+        reddit_subs_active: data.active_user_count
+      }).sort({dtg:-1}).exec().catch(function(error) {
+        console.error('In www.get_reddit_data for subreddit: '+ asset.subreddit +' error thrown executing Tick.findOneAndUpdate');
+        console.error(error);
+      });
+      if (find === undefined) continue;
+
+      if (exports.verbose) console.log('Updated Tick with subreddit ' + data.display_name);
+
+    }
 
     resolve();
     return;
@@ -290,7 +298,7 @@ var data_refresh = async function() {
   await get_reddit_data().catch(console.error);
 
   // Update tick change data
-  await get_db_tick_change_data();
+  // await get_db_tick_change_data();
 
   // Update emit structure
   let time_bucket = new Date().time_bucket();
